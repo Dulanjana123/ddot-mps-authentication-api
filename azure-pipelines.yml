@@ -1,0 +1,275 @@
+trigger:
+  - develop
+
+resources:
+  - repo: self
+
+variables:
+  dockerRegistryServiceConnection: "4d45088c-8534-42d4-bcde-26fc91a9056b"
+  imageRepository: "ddotmpsauthenticationapi"
+  containerRegistry: "ddotmpsdevcontainerregistry.azurecr.io"
+  dockerfilePath: "$(Build.SourcesDirectory)/Dockerfile"
+  tag: "$(Build.BuildId)"
+  vmImageName: "ubuntu-latest"
+
+stages:
+  - stage: BuildAndTest
+    displayName: Build and Test
+    variables:
+    - group: ddot-mps-authentication-api-pipeline_dev
+    jobs:
+      - job: BuildAndTestJob
+        displayName: Build and Test Job
+        pool:
+          vmImage: "ubuntu-latest"
+        steps:
+          # parse env variables from the azure devops variable group fetched variables
+          - script: |
+              echo "##vso[task.setvariable variable=ConnectionStrings.DefaultConnection]$(DefaultConnection)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForClient.TenantId]$(PublicPortalTenantId)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForAdmin.TenantId]$(DepartmentPortalTenantId)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForClient.ClientId]$(PublicPortalGraphApiAppClientId)" 
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForAdmin.ClientId]$(DepartmentPortalGraphApiAppClientId)" 
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForClient.GraphApiClientSecret]$(PublicPortalGraphApiAppClientSecret)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForAdmin.GraphApiClientSecret]$(DepartmentPortalGraphApiAppClientSecret)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForClient.Domain]$(PublicPortalDomain)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForAdmin.Domain]$(DepartmentPortalDomain)"
+              echo "##vso[task.setvariable variable=GlobalAppSettings.JwtSecretKey]$(JwtSecretKey)"
+              echo "##vso[task.setvariable variable=ApplicationInsights.ConnectionString]$(ApplicationInsightsConnectionString)"
+            displayName: 'Set Env Variables from KeyValut'
+          # echo the sets up envirionment variables
+          - bash: |
+              echo "Secrets Found! $(DefaultConnection) and $(ClientId) and $(JwtSecretKey)"        
+            env:
+              DefaultConnection: $(ConnectionStrings.DefaultConnection)
+              ClientId: $(GraphApiCredentialOptionsForAdmin.ClientId)
+              JwtSecretKey: $(GlobalAppSettings.JwtSecretKey)
+          # Replace placeholders in appsettings.json with environment variables
+          - task: FileTransform@2
+            inputs:
+              folderPath: '$(Build.SourcesDirectory)/DDOT.MPS.Auth.Api'  # Path to the directory containing appsettings.json
+              xmlTransformationRules: ''
+              jsonTargetFiles: '**/appsettings.json'  # Specifies that the target file is JSON
+          # Display the contents of appsettings.json after transformation
+          - task: Bash@3
+            displayName: "see the contents of appsettings.json"
+            inputs:
+              targetType: 'inline'
+              script: 'cat $(Build.SourcesDirectory)/DDOT.MPS.Auth.Api/appsettings.json'
+          - task: UseDotNet@2
+            displayName: "Install .NET Core SDK"
+            inputs:
+              version: 8.x
+              performMultiLevelLookup: true
+              includePreviewVersions: true
+
+          - task: DotNetCoreCLI@2
+            displayName: "Unit tests"
+            inputs:
+              command: "test"
+              projects: "**/*Test.csproj"
+              arguments: '--collect "XPlat Code Coverage'
+
+          - task: PublishCodeCoverageResults@1
+            displayName: "Publish code coverage"
+            inputs:
+              codeCoverageTool: "Cobertura"
+              summaryFileLocation: "$(Agent.TempDirectory)/**/*coverage.cobertura.xml"
+
+          - script: |
+              dotnet tool install --global coverlet.console
+              export PATH="$PATH:~/.dotnet/tools"
+            displayName: "Install Coverlet"
+
+          - script: |
+              coverlet ./Test/bin/Debug/net8.0/Test.dll --target "dotnet" --targetargs "test --no-build" --format opencover --output $(Build.SourcesDirectory)/coverage.xml
+            displayName: "Run coverlet for code coverage"
+
+          - script: |
+              echo "Checking if coverage file exists..."
+              ls -la $(Build.SourcesDirectory)/*.xml
+            displayName: "Check for Coverage File"
+
+          - task: PublishPipelineArtifact@1
+            inputs:
+              targetPath: "$(Build.SourcesDirectory)"
+              artifact: "build"
+              publishLocation: "pipeline"
+
+  - stage: Sonar
+    displayName: SonarQube Analysis Stage
+    # dependsOn: BuildAndTest
+    jobs:
+      - job: Sonar
+        displayName: Build the Project for Sonar Analysis
+        pool:
+          name: DdotMpsAgentPoolDev
+          demands:
+            - Agent.Name -equals mps-temp-ubuntu-2
+            - Agent.Version -gtVersion 3.238.0
+        steps:
+          - task: UseDotNet@2
+            displayName: "Install .NET Core SDK"
+            inputs:
+              version: 8.x
+              performMultiLevelLookup: true
+              includePreviewVersions: true
+
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifact: "build"
+              path: "$(Build.SourcesDirectory)"
+
+          - script: |
+              echo "Checking if coverage file exists..."
+              ls -la $(Build.SourcesDirectory)/*.xml
+            displayName: "Check for Coverage File"
+
+          - task: SonarQubePrepare@6
+            displayName: "Prepare SonarCloud analysis configuration"
+            inputs:
+              SonarQube: "mysonarqube_project"
+              scannerMode: "CLI"
+              configMode: "manual"
+              cliProjectKey: "DDOT_MPS_ddot-mps-authentication-api_f5caf9df-b911-4636-a5a2-09c091cfe0df"
+              cliProjectName: "ddot-mps-authentication-api"
+              cliSources: "."
+              extraProperties: |
+                sonar.verbose=true
+                sonar.cs.opencover.reportsPaths=$(Build.SourcesDirectory)/coverage.xml
+          # - task: PublishCodeCoverageResults@1
+          #   displayName: 'Publish code coverage'
+          #   inputs:
+          #     codeCoverageTool: 'Cobertura'
+          #     summaryFileLocation: '$(Agent.TempDirectory)/**/*coverage.cobertura.xml'
+          - task: SonarQubeAnalyze@6
+            inputs:
+              jdkversion: "JAVA_HOME_17_X64"
+
+          - task: SonarQubePublish@6
+            inputs:
+              pollingTimeoutSec: "300"
+
+  - stage: Build
+    displayName: Docker Build and Push Stage
+    variables:
+    - group: ddot-mps-authentication-api-pipeline_dev
+    jobs:
+      - job: Build
+        displayName: Build
+        pool:
+          name: DdotMpsAgentPoolDev
+          demands:
+            - Agent.Name -equals mps-temp-ubuntu-2
+            - Agent.Version -gtVersion 3.238.0
+        variables:
+        - group: ddot-mps-authentication-api-pipeline_dev
+        steps:
+          - script: |
+              echo "##vso[task.setvariable variable=ConnectionStrings.DefaultConnection]$(DefaultConnection)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForClient.TenantId]$(PublicPortalTenantId)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForAdmin.TenantId]$(DepartmentPortalTenantId)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForClient.ClientId]$(PublicPortalGraphApiAppClientId)" 
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForAdmin.ClientId]$(DepartmentPortalGraphApiAppClientId)" 
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForClient.GraphApiClientSecret]$(PublicPortalGraphApiAppClientSecret)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForAdmin.GraphApiClientSecret]$(DepartmentPortalGraphApiAppClientSecret)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForClient.Domain]$(PublicPortalDomain)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForAdmin.Domain]$(DepartmentPortalDomain)"
+              echo "##vso[task.setvariable variable=GlobalAppSettings.JwtSecretKey]$(JwtSecretKey)"
+              echo "##vso[task.setvariable variable=ApplicationInsights.ConnectionString]$(ApplicationInsightsConnectionString)"
+            displayName: 'Set Env Variables from KeyValut'
+          # Replace placeholders in appsettings.json with environment variables
+          - task: FileTransform@2
+            inputs:
+              folderPath: '$(Build.SourcesDirectory)/DDOT.MPS.Auth.Api'  # Path to the directory containing appsettings.json
+              xmlTransformationRules: ''
+              jsonTargetFiles: '**/appsettings.json'  # Specifies that the target file is JSON
+          # Display the contents of appsettings.json after transformation
+          - task: Bash@3
+            displayName: "see the contents of appsettings.json"
+            inputs:
+              targetType: 'inline'
+              script: 'cat $(Build.SourcesDirectory)/DDOT.MPS.Auth.Api/appsettings.json'
+
+          - task: Docker@2
+            displayName: Build Docker Image
+            inputs:
+              command: build
+              repository: $(imageRepository)
+              dockerfile: $(dockerfilePath)              
+              containerRegistry: $(dockerRegistryServiceConnection)
+              tags: |
+                $(tag)
+              # arguments: --build-arg ENV=QA
+            # env:
+            #   DefaultConnection: $(DefaultConnection)
+            #   ClientId: $(ClientId)
+            #   JwtSecretKey: $(JwtSecretKey)
+
+          - task: Docker@2
+            displayName: Push Docker Image to Container Registry
+            inputs:
+              command: push
+              repository: $(imageRepository)
+              tags: |
+                $(tag)
+              containerRegistry: $(dockerRegistryServiceConnection)
+
+          - script: |
+              echo "Deleting Docker images in the build agent to free up space"
+              sudo docker system prune -f -a --volumes
+            displayName: "Remove Docker Images in the Build Agent"
+
+  - stage: Deploy
+    displayName: Deploy to Azure Container Apps
+    condition: and(succeeded(), ne(variables['Build.Reason'], 'PullRequest'))
+    variables:
+    - group: ddot-mps-authentication-api-pipeline_dev
+    jobs:
+      - job: Deploy
+        displayName: Deploy Job
+        pool:
+          name: DdotMpsAgentPoolDev
+          demands:
+            - Agent.Name -equals mps-temp-ubuntu-2
+        steps:
+          - script: |
+              echo "##vso[task.setvariable variable=ConnectionStrings.DefaultConnection]$(DefaultConnection)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForClient.TenantId]$(PublicPortalTenantId)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForAdmin.TenantId]$(DepartmentPortalTenantId)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForClient.ClientId]$(PublicPortalGraphApiAppClientId)" 
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForAdmin.ClientId]$(DepartmentPortalGraphApiAppClientId)" 
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForClient.GraphApiClientSecret]$(PublicPortalGraphApiAppClientSecret)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForAdmin.GraphApiClientSecret]$(DepartmentPortalGraphApiAppClientSecret)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForClient.Domain]$(PublicPortalDomain)"
+              echo "##vso[task.setvariable variable=GraphApiCredentialOptionsForAdmin.Domain]$(DepartmentPortalDomain)"
+              echo "##vso[task.setvariable variable=GlobalAppSettings.JwtSecretKey]$(JwtSecretKey)"
+              echo "##vso[task.setvariable variable=ApplicationInsights.ConnectionString]$(ApplicationInsightsConnectionString)"
+            displayName: 'Set Env Variables from KeyValut'
+          # Replace placeholders in appsettings.json with environment variables
+          - task: FileTransform@2
+            inputs:
+              folderPath: '$(Build.SourcesDirectory)/DDOT.MPS.Auth.Api'  # Path to the directory containing appsettings.json
+              xmlTransformationRules: ''
+              jsonTargetFiles: '**/appsettings.json'  # Specifies that the target file is JSON
+          # Display the contents of appsettings.json after transformation
+          - task: Bash@3
+            displayName: "see the contents of appsettings.json"
+            inputs:
+              targetType: 'inline'
+              script: 'cat $(Build.SourcesDirectory)/DDOT.MPS.Auth.Api/appsettings.json'
+                                  
+          - task: AzureContainerApps@1
+            inputs:
+              azureSubscription: "ddot_mps_azure_devops_service_connection"
+              containerAppName: "ddot-mps-dev-authentication-app"
+              resourceGroup: "ddot-mps-dev-rg"
+              imageToDeploy: "$(containerRegistry)/$(imageRepository):$(tag)"
+              #environmentVariables: 'DefaultConnection=$(ConnectionStrings.DefaultConnection) SignInPolicyIdGraphApiCredentialOptionsForClient=$(GraphApiCredentialOptionsForClient.SignInPolicyId) B2CSignInPolicyIdGraphApiCredentialOptionsForAdmin=$(GraphApiCredentialOptionsForAdmin.SignInPolicyId) ClientIdGraphApiCredentialOptionsForAdmin=$(GraphApiCredentialOptionsForAdmin.ClientId) ClientIdGraphApiCredentialOptionsForClient=$(GraphApiCredentialOptionsForClient.ClientId) JwtSecretKey=$(GlobalAppSettings.JwtSecretKey) B2CGraphApiClientSecretGraphApiCredentialOptionsForClient=$(GraphApiCredentialOptionsForClient.GraphApiClientSecret) B2CGraphApiClientSecretGraphApiCredentialOptionsForAdmin=$(GraphApiCredentialOptionsForAdmin.GraphApiClientSecret)'
+
+          - bash: |
+              echo "Secrets Found! $(DefaultConnection) and $(ClientId) and $(JwtSecretKey)"        
+            env:
+              DefaultConnection: $(ConnectionStrings.DefaultConnection)
+              ClientId: $(GraphApiCredentialOptionsForAdmin.ClientId)
+              JwtSecretKey: $(GlobalAppSettings.JwtSecretKey)
