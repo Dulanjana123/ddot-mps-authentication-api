@@ -1,0 +1,1 @@
+Scaffold-DbContext "Host=ddot-mps-pgsql-srv-development.postgres.database.azure.com;Database=MPS_DEV;Username=psqladmin;Password=H@Sh1CoR3!" Npgsql.EntityFrameworkCore.PostgreSQL -OutputDir Entities -ContextDir DBContexts -Context UserDbContext -Force
